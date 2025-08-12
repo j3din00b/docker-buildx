@@ -5,13 +5,15 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/compose-spec/compose-go/v2/consts"
 	"github.com/compose-spec/compose-go/v2/dotenv"
 	"github.com/compose-spec/compose-go/v2/loader"
+	composeschema "github.com/compose-spec/compose-go/v2/schema"
 	composetypes "github.com/compose-spec/compose-go/v2/types"
+	"github.com/docker/buildx/util/buildflags"
 	dockeropts "github.com/docker/cli/opts"
 	"github.com/docker/go-units"
 	"github.com/pkg/errors"
@@ -34,21 +36,7 @@ func ParseComposeFiles(fs []File) (*Config, error) {
 }
 
 func ParseCompose(cfgs []composetypes.ConfigFile, envs map[string]string) (*Config, error) {
-	if envs == nil {
-		envs = make(map[string]string)
-	}
-	cfg, err := loader.LoadWithContext(context.Background(), composetypes.ConfigDetails{
-		ConfigFiles: cfgs,
-		Environment: envs,
-	}, func(options *loader.Options) {
-		projectName := "bake"
-		if v, ok := envs[consts.ComposeProjectName]; ok && v != "" {
-			projectName = v
-		}
-		options.SetProjectName(projectName, false)
-		options.SkipNormalization = true
-		options.Profiles = []string{"*"}
-	})
+	cfg, err := loadComposeFiles(cfgs, envs)
 	if err != nil {
 		return nil, err
 	}
@@ -61,7 +49,6 @@ func ParseCompose(cfgs []composetypes.ConfigFile, envs map[string]string) (*Conf
 		g := &Group{Name: "default"}
 
 		for _, s := range cfg.Services {
-			s := s
 			if s.Build == nil {
 				continue
 			}
@@ -91,6 +78,9 @@ func ParseCompose(cfgs []composetypes.ConfigFile, envs map[string]string) (*Conf
 			if s.Build.AdditionalContexts != nil {
 				additionalContexts = map[string]string{}
 				for k, v := range s.Build.AdditionalContexts {
+					if strings.HasPrefix(v, "service:") {
+						v = strings.Replace(v, "service:", "target:", 1)
+					}
 					additionalContexts[k] = v
 				}
 			}
@@ -119,14 +109,24 @@ func ParseCompose(cfgs []composetypes.ConfigFile, envs map[string]string) (*Conf
 				}
 			}
 
-			var ssh []string
+			extraHosts := map[string]*string{}
+			if s.Build.ExtraHosts != nil {
+				for k, v := range s.Build.ExtraHosts {
+					vv := strings.Join(v, ",")
+					extraHosts[k] = &vv
+				}
+			}
+
+			var ssh []*buildflags.SSH
 			for _, bkey := range s.Build.SSH {
 				sshkey := composeToBuildkitSSH(bkey)
 				ssh = append(ssh, sshkey)
 			}
-			sort.Strings(ssh)
+			slices.SortFunc(ssh, func(a, b *buildflags.SSH) int {
+				return a.Less(b)
+			})
 
-			var secrets []string
+			var secrets []*buildflags.Secret
 			for _, bs := range s.Build.Secrets {
 				secret, err := composeToBuildkitSecret(bs, cfg.Secrets[bs.Source])
 				if err != nil {
@@ -138,8 +138,17 @@ func ParseCompose(cfgs []composetypes.ConfigFile, envs map[string]string) (*Conf
 			// compose does not support nil values for labels
 			labels := map[string]*string{}
 			for k, v := range s.Build.Labels {
-				v := v
 				labels[k] = &v
+			}
+
+			cacheFrom, err := buildflags.ParseCacheEntry(s.Build.CacheFrom)
+			if err != nil {
+				return nil, err
+			}
+
+			cacheTo, err := buildflags.ParseCacheEntry(s.Build.CacheTo)
+			if err != nil {
+				return nil, err
 			}
 
 			g.Targets = append(g.Targets, targetName)
@@ -158,13 +167,15 @@ func ParseCompose(cfgs []composetypes.ConfigFile, envs map[string]string) (*Conf
 					val, ok := cfg.Environment[val]
 					return val, ok
 				})),
-				CacheFrom:   s.Build.CacheFrom,
-				CacheTo:     s.Build.CacheTo,
+				CacheFrom:   cacheFrom,
+				CacheTo:     cacheTo,
 				NetworkMode: networkModeP,
+				Platforms:   s.Build.Platforms,
 				SSH:         ssh,
 				Secrets:     secrets,
 				ShmSize:     shmSize,
 				Ulimits:     ulimits,
+				ExtraHosts:  extraHosts,
 			}
 			if err = t.composeExtTarget(s.Build.Extensions); err != nil {
 				return nil, err
@@ -184,10 +195,74 @@ func ParseCompose(cfgs []composetypes.ConfigFile, envs map[string]string) (*Conf
 	return &c, nil
 }
 
+func loadComposeFiles(cfgs []composetypes.ConfigFile, envs map[string]string, options ...func(*loader.Options)) (*composetypes.Project, error) {
+	if envs == nil {
+		envs = make(map[string]string)
+	}
+
+	cfgDetails := composetypes.ConfigDetails{
+		ConfigFiles: cfgs,
+		Environment: envs,
+	}
+
+	raw, err := loader.LoadModelWithContext(context.Background(), cfgDetails, append([]func(*loader.Options){func(opts *loader.Options) {
+		projectName := "bake"
+		if v, ok := envs[consts.ComposeProjectName]; ok && v != "" {
+			projectName = v
+		}
+		opts.SetProjectName(projectName, false)
+		opts.SkipNormalization = true
+		opts.SkipValidation = true
+	}}, options...)...)
+	if err != nil {
+		return nil, err
+	}
+
+	filtered := make(map[string]any)
+	for _, key := range []string{"services", "secrets"} {
+		if key == "services" {
+			if services, ok := raw["services"].(map[string]any); ok {
+				filteredServices := make(map[string]any)
+				for svcName, svc := range services {
+					if svc == nil {
+						filteredServices[svcName] = map[string]any{}
+					} else if svcMap, ok := svc.(map[string]any); ok {
+						filteredService := make(map[string]any)
+						for _, svcField := range []string{"image", "build", "environment", "env_file"} {
+							if val, ok := svcMap[svcField]; ok {
+								filteredService[svcField] = val
+							}
+						}
+						filteredServices[svcName] = filteredService
+					}
+				}
+				filtered["services"] = filteredServices
+			}
+		} else if v, ok := raw[key]; ok {
+			filtered[key] = v
+		}
+	}
+	if len(filtered) == 0 {
+		return nil, errors.New("empty compose file")
+	}
+
+	if err := composeschema.Validate(filtered); err != nil {
+		return nil, err
+	}
+
+	return loader.ModelToProject(filtered, loader.ToOptions(&cfgDetails, append([]func(*loader.Options){func(options *loader.Options) {
+		options.SkipNormalization = true
+		options.Profiles = []string{"*"}
+	}}, options...)), composetypes.ConfigDetails{
+		ConfigFiles: cfgs,
+		Environment: envs,
+	})
+}
+
 func validateComposeFile(dt []byte, fn string) (bool, error) {
 	envs, err := composeEnv()
 	if err != nil {
-		return true, err
+		return false, err
 	}
 	fnl := strings.ToLower(fn)
 	if strings.HasSuffix(fnl, ".yml") || strings.HasSuffix(fnl, ".yaml") {
@@ -201,16 +276,7 @@ func validateComposeFile(dt []byte, fn string) (bool, error) {
 }
 
 func validateCompose(dt []byte, envs map[string]string) error {
-	_, err := loader.Load(composetypes.ConfigDetails{
-		ConfigFiles: []composetypes.ConfigFile{
-			{
-				Content: dt,
-			},
-		},
-		Environment: envs,
-	}, func(options *loader.Options) {
-		options.SetProjectName("bake", false)
-		options.SkipNormalization = true
+	_, err := loadComposeFiles([]composetypes.ConfigFile{{Content: dt}}, envs, func(options *loader.Options) {
 		// consistency is checked later in ParseCompose to ensure multiple
 		// compose files can be merged together
 		options.SkipConsistencyCheck = true
@@ -239,10 +305,13 @@ func loadDotEnv(curenv map[string]string, workingDir string) (map[string]string,
 		return nil, err
 	}
 
-	if _, err = os.Stat(ef); os.IsNotExist(err) {
-		return curenv, nil
-	} else if err != nil {
+	if st, err := os.Stat(ef); err != nil {
+		if os.IsNotExist(err) {
+			return curenv, nil
+		}
 		return nil, err
+	} else if st.IsDir() {
+		return curenv, nil
 	}
 
 	dt, err := os.ReadFile(ef)
@@ -250,7 +319,10 @@ func loadDotEnv(curenv map[string]string, workingDir string) (map[string]string,
 		return nil, err
 	}
 
-	envs, err := dotenv.UnmarshalBytesWithLookup(dt, nil)
+	envs, err := dotenv.UnmarshalBytesWithLookup(dt, func(k string) (string, bool) {
+		v, ok := curenv[k]
+		return v, ok
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -297,10 +369,12 @@ type xbake struct {
 	// https://github.com/docker/docs/blob/main/content/build/bake/compose-file.md#extension-field-with-x-bake
 }
 
-type stringMap map[string]string
-type stringArray []string
+type (
+	stringMap   map[string]string
+	stringArray []string
+)
 
-func (sa *stringArray) UnmarshalYAML(unmarshal func(interface{}) error) error {
+func (sa *stringArray) UnmarshalYAML(unmarshal func(any) error) error {
 	var multi []string
 	err := unmarshal(&multi)
 	if err != nil {
@@ -317,7 +391,7 @@ func (sa *stringArray) UnmarshalYAML(unmarshal func(interface{}) error) error {
 
 // composeExtTarget converts Compose build extension x-bake to bake Target
 // https://github.com/compose-spec/compose-spec/blob/master/spec.md#extension
-func (t *Target) composeExtTarget(exts map[string]interface{}) error {
+func (t *Target) composeExtTarget(exts map[string]any) error {
 	var xb xbake
 
 	ext, ok := exts["x-bake"]
@@ -334,23 +408,45 @@ func (t *Target) composeExtTarget(exts map[string]interface{}) error {
 		t.Tags = dedupSlice(append(t.Tags, xb.Tags...))
 	}
 	if len(xb.CacheFrom) > 0 {
-		t.CacheFrom = dedupSlice(append(t.CacheFrom, xb.CacheFrom...))
+		cacheFrom, err := buildflags.ParseCacheEntry(xb.CacheFrom)
+		if err != nil {
+			return err
+		}
+		t.CacheFrom = t.CacheFrom.Merge(cacheFrom)
 	}
 	if len(xb.CacheTo) > 0 {
-		t.CacheTo = dedupSlice(append(t.CacheTo, xb.CacheTo...))
+		cacheTo, err := buildflags.ParseCacheEntry(xb.CacheTo)
+		if err != nil {
+			return err
+		}
+		t.CacheTo = t.CacheTo.Merge(cacheTo)
 	}
 	if len(xb.Secrets) > 0 {
-		t.Secrets = dedupSlice(append(t.Secrets, xb.Secrets...))
+		secrets, err := parseArrValue[buildflags.Secret](xb.Secrets)
+		if err != nil {
+			return err
+		}
+		t.Secrets = t.Secrets.Merge(secrets)
 	}
 	if len(xb.SSH) > 0 {
-		t.SSH = dedupSlice(append(t.SSH, xb.SSH...))
-		sort.Strings(t.SSH)
+		ssh, err := parseArrValue[buildflags.SSH](xb.SSH)
+		if err != nil {
+			return err
+		}
+		t.SSH = t.SSH.Merge(ssh)
+		slices.SortFunc(t.SSH, func(a, b *buildflags.SSH) int {
+			return a.Less(b)
+		})
 	}
 	if len(xb.Platforms) > 0 {
 		t.Platforms = dedupSlice(append(t.Platforms, xb.Platforms...))
 	}
 	if len(xb.Outputs) > 0 {
-		t.Outputs = dedupSlice(append(t.Outputs, xb.Outputs...))
+		outputs, err := parseArrValue[buildflags.ExportEntry](xb.Outputs)
+		if err != nil {
+			return err
+		}
+		t.Outputs = t.Outputs.Merge(outputs)
 	}
 	if xb.Pull != nil {
 		t.Pull = xb.Pull
@@ -370,35 +466,30 @@ func (t *Target) composeExtTarget(exts map[string]interface{}) error {
 
 // composeToBuildkitSecret converts secret from compose format to buildkit's
 // csv format.
-func composeToBuildkitSecret(inp composetypes.ServiceSecretConfig, psecret composetypes.SecretConfig) (string, error) {
+func composeToBuildkitSecret(inp composetypes.ServiceSecretConfig, psecret composetypes.SecretConfig) (*buildflags.Secret, error) {
 	if psecret.External {
-		return "", errors.Errorf("unsupported external secret %s", psecret.Name)
+		return nil, errors.Errorf("unsupported external secret %s", psecret.Name)
 	}
 
-	var bkattrs []string
+	secret := &buildflags.Secret{}
 	if inp.Source != "" {
-		bkattrs = append(bkattrs, "id="+inp.Source)
+		secret.ID = inp.Source
 	}
 	if psecret.File != "" {
-		bkattrs = append(bkattrs, "src="+psecret.File)
+		secret.FilePath = psecret.File
 	}
 	if psecret.Environment != "" {
-		bkattrs = append(bkattrs, "env="+psecret.Environment)
+		secret.Env = psecret.Environment
 	}
-
-	return strings.Join(bkattrs, ","), nil
+	return secret, nil
 }
 
 // composeToBuildkitSSH converts secret from compose format to buildkit's
 // csv format.
-func composeToBuildkitSSH(sshKey composetypes.SSHKey) string {
-	var bkattrs []string
-
-	bkattrs = append(bkattrs, sshKey.ID)
-
+func composeToBuildkitSSH(sshKey composetypes.SSHKey) *buildflags.SSH {
+	bkssh := &buildflags.SSH{ID: sshKey.ID}
 	if sshKey.Path != "" {
-		bkattrs = append(bkattrs, sshKey.Path)
+		bkssh.Paths = []string{sshKey.Path}
 	}
-
-	return strings.Join(bkattrs, "=")
+	return bkssh
 }

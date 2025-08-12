@@ -30,8 +30,11 @@ func init() {
 	transformers["services.*.build.additional_contexts"] = transformKeyValue
 	transformers["services.*.depends_on"] = transformDependsOn
 	transformers["services.*.env_file"] = transformEnvFile
+	transformers["services.*.label_file"] = transformStringOrList
 	transformers["services.*.extends"] = transformExtends
-	transformers["services.*.networks"] = transformServiceNetworks
+	transformers["services.*.gpus"] = transformGpus
+	transformers["services.*.networks"] = transformStringSliceToMap
+	transformers["services.*.models"] = transformStringSliceToMap
 	transformers["services.*.volumes.*"] = transformVolumeMount
 	transformers["services.*.dns"] = transformStringOrList
 	transformers["services.*.devices.*"] = transformDeviceMapping
@@ -42,6 +45,8 @@ func init() {
 	transformers["services.*.build.ssh"] = transformSSH
 	transformers["services.*.ulimits.*"] = transformUlimits
 	transformers["services.*.build.ulimits.*"] = transformUlimits
+	transformers["services.*.develop.watch.*.ignore"] = transformStringOrList
+	transformers["services.*.develop.watch.*.include"] = transformStringOrList
 	transformers["volumes.*"] = transformMaybeExternal
 	transformers["networks.*"] = transformMaybeExternal
 	transformers["secrets.*"] = transformMaybeExternal

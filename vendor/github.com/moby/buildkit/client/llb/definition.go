@@ -16,7 +16,6 @@ import (
 // For example, after marshalling a LLB state and sending over the wire, the
 // LLB state can be reconstructed from the definition.
 type DefinitionOp struct {
-	MarshalCache
 	mu         sync.Mutex
 	ops        map[digest.Digest]*pb.Op
 	defs       map[digest.Digest][]byte
@@ -241,7 +240,7 @@ func (d *DefinitionOp) Inputs() []Output {
 		d.mu.Unlock()
 
 		inputs = append(inputs, &output{vertex: vtx, platform: platform, getIndex: func() (pb.OutputIndex, error) {
-			return pb.OutputIndex(vtx.index), nil
+			return vtx.index, nil
 		}})
 	}
 

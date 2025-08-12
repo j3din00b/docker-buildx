@@ -22,7 +22,6 @@ import (
 	"github.com/docker/buildx/bake/hclparser"
 	"github.com/docker/buildx/build"
 	"github.com/docker/buildx/builder"
-	"github.com/docker/buildx/controller/pb"
 	"github.com/docker/buildx/localstate"
 	"github.com/docker/buildx/util/buildflags"
 	"github.com/docker/buildx/util/cobrautil"
@@ -38,30 +37,45 @@ import (
 	"github.com/moby/buildkit/util/progress/progressui"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
+	"github.com/tonistiigi/go-csvvalue"
 	"go.opentelemetry.io/otel/attribute"
 )
 
+const (
+	bakeEnvFileSeparator = "BUILDX_BAKE_PATH_SEPARATOR"
+	bakeEnvFilePath      = "BUILDX_BAKE_FILE"
+)
+
 type bakeOptions struct {
-	files       []string
-	overrides   []string
-	printOnly   bool
-	listTargets bool
-	listVars    bool
-	sbom        string
-	provenance  string
-	allow       []string
+	files     []string
+	overrides []string
+
+	sbom       string
+	provenance string
+	allow      []string
 
 	builder      string
 	metadataFile string
 	exportPush   bool
 	exportLoad   bool
 	callFunc     string
+
+	print bool
+	list  string
+
+	// TODO: remove deprecated flags
+	listTargets bool
+	listVars    bool
 }
 
-func runBake(ctx context.Context, dockerCli command.Cli, targets []string, in bakeOptions, cFlags commonFlags) (err error) {
+func runBake(ctx context.Context, dockerCli command.Cli, targets []string, in bakeOptions, cFlags commonFlags, filesFromEnv bool) (err error) {
 	mp := dockerCli.MeterProvider()
 
-	ctx, end, err := tracing.TraceCurrentCommand(ctx, "bake")
+	ctx, end, err := tracing.TraceCurrentCommand(ctx, append([]string{"bake"}, targets...),
+		attribute.String("builder", in.builder),
+		attribute.StringSlice("targets", targets),
+		attribute.StringSlice("files", in.files),
+	)
 	if err != nil {
 		return err
 	}
@@ -121,9 +135,13 @@ func runBake(ctx context.Context, dockerCli command.Cli, targets []string, in ba
 	var nodes []builder.Node
 	var progressConsoleDesc, progressTextDesc string
 
+	if in.print && in.list != "" {
+		return errors.New("--print and --list are mutually exclusive")
+	}
+
 	// instance only needed for reading remote bake files or building
 	var driverType string
-	if url != "" || !(in.printOnly || in.listTargets || in.listVars) {
+	if url != "" || (!in.print && in.list == "") {
 		b, err := builder.New(dockerCli,
 			builder.WithName(in.builder),
 			builder.WithContextPathHash(contextPathHash),
@@ -150,7 +168,13 @@ func runBake(ctx context.Context, dockerCli command.Cli, targets []string, in ba
 	attributes := bakeMetricAttributes(dockerCli, driverType, url, cmdContext, targets, &in)
 
 	progressMode := progressui.DisplayMode(cFlags.progress)
+
 	var printer *progress.Printer
+	defer func() {
+		if printer != nil {
+			printer.Wait()
+		}
+	}()
 
 	makePrinter := func() error {
 		var err error
@@ -168,7 +192,7 @@ func runBake(ctx context.Context, dockerCli command.Cli, targets []string, in ba
 		return err
 	}
 
-	files, inp, err := readBakeFiles(ctx, nodes, url, in.files, dockerCli.In(), printer)
+	files, inp, err := readBakeFiles(ctx, nodes, url, in.files, dockerCli.In(), printer, filesFromEnv)
 	if err != nil {
 		return err
 	}
@@ -184,7 +208,7 @@ func runBake(ctx context.Context, dockerCli command.Cli, targets []string, in ba
 		"BAKE_LOCAL_PLATFORM": platforms.Format(platforms.DefaultSpec()),
 	}
 
-	if in.listTargets || in.listVars {
+	if in.list != "" {
 		cfg, pm, err := bake.ParseFiles(files, defaults)
 		if err != nil {
 			return err
@@ -192,10 +216,15 @@ func runBake(ctx context.Context, dockerCli command.Cli, targets []string, in ba
 		if err = printer.Wait(); err != nil {
 			return err
 		}
-		if in.listTargets {
-			return printTargetList(dockerCli.Out(), cfg)
-		} else if in.listVars {
-			return printVars(dockerCli.Out(), pm.AllVariables)
+		list, err := parseList(in.list)
+		if err != nil {
+			return err
+		}
+		switch list.Type {
+		case "targets":
+			return printTargetList(dockerCli.Out(), list.Format, cfg)
+		case "variables":
+			return printVars(dockerCli.Out(), list.Format, pm.AllVariables)
 		}
 	}
 
@@ -231,7 +260,7 @@ func runBake(ctx context.Context, dockerCli command.Cli, targets []string, in ba
 		Target: tgts,
 	}
 
-	if in.printOnly {
+	if in.print {
 		if err = printer.Wait(); err != nil {
 			return err
 		}
@@ -243,13 +272,18 @@ func runBake(ctx context.Context, dockerCli command.Cli, targets []string, in ba
 		return err
 	}
 
-	for _, opt := range bo {
+	for k, opt := range bo {
 		if opt.CallFunc != nil {
 			cf, err := buildflags.ParseCallFunc(opt.CallFunc.Name)
 			if err != nil {
 				return err
 			}
-			opt.CallFunc.Name = cf.Name
+			if cf == nil {
+				opt.CallFunc = nil
+				bo[k] = opt
+			} else {
+				opt.CallFunc.Name = cf.Name
+			}
 		}
 	}
 
@@ -257,8 +291,10 @@ func runBake(ctx context.Context, dockerCli command.Cli, targets []string, in ba
 	if err != nil {
 		return err
 	}
-	if err := exp.Prompt(ctx, url != "", &syncWriter{w: dockerCli.Err(), wait: printer.Wait}); err != nil {
-		return err
+	if progressMode != progressui.RawJSONMode {
+		if err := exp.Prompt(ctx, url != "", &syncWriter{w: dockerCli.Err(), wait: printer.Wait}); err != nil {
+			return err
+		}
 	}
 	if printer.IsDone() {
 		// init new printer as old one was stopped to show the prompt
@@ -267,7 +303,7 @@ func runBake(ctx context.Context, dockerCli command.Cli, targets []string, in ba
 		}
 	}
 
-	if err := saveLocalStateGroup(dockerCli, in, targets, bo, overrides, def); err != nil {
+	if err := saveLocalStateGroup(dockerCli, in, targets, bo); err != nil {
 		return err
 	}
 
@@ -289,7 +325,7 @@ func runBake(ctx context.Context, dockerCli command.Cli, targets []string, in ba
 		desktop.PrintBuildDetails(os.Stderr, printer.BuildRefs(), term)
 	}
 	if len(in.metadataFile) > 0 {
-		dt := make(map[string]interface{})
+		dt := make(map[string]any)
 		for t, r := range resp {
 			dt[t] = decodeExporterResponse(r.ExporterResponse)
 		}
@@ -323,7 +359,7 @@ func runBake(ctx context.Context, dockerCli command.Cli, targets []string, in ba
 			continue
 		}
 
-		pf := &pb.CallFunc{
+		pf := &buildflags.CallFunc{
 			Name:         req.CallFunc.Name,
 			Format:       req.CallFunc.Format,
 			IgnoreStatus: req.CallFunc.IgnoreStatus,
@@ -404,8 +440,16 @@ func runBake(ctx context.Context, dockerCli command.Cli, targets []string, in ba
 		fmt.Fprintln(dockerCli.Out(), string(dt))
 	}
 
+	for _, name := range names {
+		if sp, ok := resp[name]; ok {
+			if v, ok := sp.ExporterResponse["frontend.result.inlinemessage"]; ok {
+				fmt.Fprintf(dockerCli.Out(), "\n# %s\n%s\n", name, v)
+			}
+		}
+	}
+
 	if exitCode != 0 {
-		os.Exit(exitCode)
+		return cobrautil.ExitCodeError(exitCode)
 	}
 
 	return nil
@@ -420,6 +464,15 @@ func bakeCmd(dockerCli command.Cli, rootOpts *rootOptions) *cobra.Command {
 		Aliases: []string{"f"},
 		Short:   "Build from a file",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			filesFromEnv := false
+			if len(options.files) == 0 {
+				if envFiles, err := bakeEnvFiles(os.LookupEnv); err != nil {
+					return err
+				} else if len(envFiles) > 0 {
+					options.files = envFiles
+					filesFromEnv = true
+				}
+			}
 			// reset to nil to avoid override is unset
 			if !cmd.Flags().Lookup("no-cache").Changed {
 				cFlags.noCache = nil
@@ -427,10 +480,17 @@ func bakeCmd(dockerCli command.Cli, rootOpts *rootOptions) *cobra.Command {
 			if !cmd.Flags().Lookup("pull").Changed {
 				cFlags.pull = nil
 			}
+			if options.list == "" {
+				if options.listTargets {
+					options.list = "targets"
+				} else if options.listVars {
+					options.list = "variables"
+				}
+			}
 			options.builder = rootOpts.builder
 			options.metadataFile = cFlags.metadataFile
 			// Other common flags (noCache, pull and progress) are processed in runBake function.
-			return runBake(cmd.Context(), dockerCli, args, options, cFlags)
+			return runBake(cmd.Context(), dockerCli, args, options, cFlags, filesFromEnv)
 		},
 		ValidArgsFunction: completion.BakeTargets(options.files),
 	}
@@ -439,7 +499,6 @@ func bakeCmd(dockerCli command.Cli, rootOpts *rootOptions) *cobra.Command {
 
 	flags.StringArrayVarP(&options.files, "file", "f", []string{}, "Build definition file")
 	flags.BoolVar(&options.exportLoad, "load", false, `Shorthand for "--set=*.output=type=docker"`)
-	flags.BoolVar(&options.printOnly, "print", false, "Print the options without building")
 	flags.BoolVar(&options.exportPush, "push", false, `Shorthand for "--set=*.output=type=registry"`)
 	flags.StringVar(&options.sbom, "sbom", "", `Shorthand for "--set=*.attest=type=sbom"`)
 	flags.StringVar(&options.provenance, "provenance", "", `Shorthand for "--set=*.attest=type=provenance"`)
@@ -450,20 +509,61 @@ func bakeCmd(dockerCli command.Cli, rootOpts *rootOptions) *cobra.Command {
 	flags.VarPF(callAlias(&options.callFunc, "check"), "check", "", `Shorthand for "--call=check"`)
 	flags.Lookup("check").NoOptDefVal = "true"
 
-	flags.BoolVar(&options.listTargets, "list-targets", false, "List available targets")
-	cobrautil.MarkFlagsExperimental(flags, "list-targets")
-	flags.MarkHidden("list-targets")
+	flags.BoolVar(&options.print, "print", false, "Print the options without building")
+	flags.StringVar(&options.list, "list", "", "List targets or variables")
 
+	// TODO: remove deprecated flags
+	flags.BoolVar(&options.listTargets, "list-targets", false, "List available targets")
+	flags.MarkHidden("list-targets")
+	flags.MarkDeprecated("list-targets", "list-targets is deprecated, use list=targets instead")
 	flags.BoolVar(&options.listVars, "list-variables", false, "List defined variables")
-	cobrautil.MarkFlagsExperimental(flags, "list-variables")
 	flags.MarkHidden("list-variables")
+	flags.MarkDeprecated("list-variables", "list-variables is deprecated, use list=variables instead")
 
 	commonBuildFlags(&cFlags, flags)
 
 	return cmd
 }
 
-func saveLocalStateGroup(dockerCli command.Cli, in bakeOptions, targets []string, bo map[string]build.Options, overrides []string, def any) error {
+func bakeEnvFiles(lookup func(string string) (string, bool)) ([]string, error) {
+	sep, _ := lookup(bakeEnvFileSeparator)
+	if sep == "" {
+		sep = string(os.PathListSeparator)
+	}
+	f, ok := lookup(bakeEnvFilePath)
+	if ok {
+		return cleanPaths(strings.Split(f, sep))
+	}
+	return []string{}, nil
+}
+
+func cleanPaths(p []string) ([]string, error) {
+	var paths []string
+	for _, f := range p {
+		f = strings.TrimSpace(f)
+		if f == "" {
+			continue
+		}
+		if f == "-" {
+			paths = append(paths, f)
+			continue
+		}
+		if _, err := os.Stat(f); err != nil {
+			return nil, err
+		}
+		paths = append(paths, f)
+	}
+	return paths, nil
+}
+
+func saveLocalStateGroup(dockerCli command.Cli, in bakeOptions, targets []string, bo map[string]build.Options) error {
+	l, err := localstate.New(confutil.NewConfig(dockerCli))
+	if err != nil {
+		return err
+	}
+
+	defer l.MigrateIfNeeded()
+
 	prm := confutil.MetadataProvenance()
 	if len(in.metadataFile) == 0 {
 		prm = confutil.MetadataProvenanceModeDisabled
@@ -483,19 +583,10 @@ func saveLocalStateGroup(dockerCli command.Cli, in bakeOptions, targets []string
 	if len(refs) == 0 {
 		return nil
 	}
-	l, err := localstate.New(confutil.NewConfig(dockerCli))
-	if err != nil {
-		return err
-	}
-	dtdef, err := json.MarshalIndent(def, "", "  ")
-	if err != nil {
-		return err
-	}
+
 	return l.SaveGroup(groupRef, localstate.StateGroup{
-		Definition: dtdef,
-		Targets:    targets,
-		Inputs:     overrides,
-		Refs:       refs,
+		Refs:    refs,
+		Targets: targets,
 	})
 }
 
@@ -514,13 +605,12 @@ func bakeArgs(args []string) (url, cmdContext string, targets []string) {
 	return url, cmdContext, targets
 }
 
-func readBakeFiles(ctx context.Context, nodes []builder.Node, url string, names []string, stdin io.Reader, pw progress.Writer) (files []bake.File, inp *bake.Input, err error) {
+func readBakeFiles(ctx context.Context, nodes []builder.Node, url string, names []string, stdin io.Reader, pw progress.Writer, filesFromEnv bool) (files []bake.File, inp *bake.Input, err error) {
 	var lnames []string // local
 	var rnames []string // remote
 	var anames []string // both
 	for _, v := range names {
-		if strings.HasPrefix(v, "cwd://") {
-			tname := strings.TrimPrefix(v, "cwd://")
+		if tname, ok := strings.CutPrefix(v, "cwd://"); ok {
 			lnames = append(lnames, tname)
 			anames = append(anames, tname)
 		} else {
@@ -540,7 +630,11 @@ func readBakeFiles(ctx context.Context, nodes []builder.Node, url string, names 
 
 	if len(lnames) > 0 || url == "" {
 		var lfiles []bake.File
-		progress.Wrap("[internal] load local bake definitions", pw.Write, func(sub progress.SubLogger) error {
+		where := ""
+		if filesFromEnv {
+			where = " from " + bakeEnvFilePath + " env"
+		}
+		progress.Wrap("[internal] load local bake definitions"+where, pw.Write, func(sub progress.SubLogger) error {
 			if url != "" {
 				lfiles, err = bake.ReadLocalFiles(lnames, stdin, sub)
 			} else {
@@ -557,14 +651,74 @@ func readBakeFiles(ctx context.Context, nodes []builder.Node, url string, names 
 	return
 }
 
-func printVars(w io.Writer, vars []*hclparser.Variable) error {
+type listEntry struct {
+	Type   string
+	Format string
+}
+
+func parseList(input string) (listEntry, error) {
+	res := listEntry{}
+
+	fields, err := csvvalue.Fields(input, nil)
+	if err != nil {
+		return res, err
+	}
+
+	if len(fields) == 1 && fields[0] == input && !strings.HasPrefix(input, "type=") {
+		res.Type = input
+	}
+
+	if res.Type == "" {
+		for _, field := range fields {
+			key, value, ok := strings.Cut(field, "=")
+			if !ok {
+				return res, errors.Errorf("invalid value %s", field)
+			}
+			key = strings.TrimSpace(strings.ToLower(key))
+			switch key {
+			case "type":
+				res.Type = value
+			case "format":
+				res.Format = value
+			default:
+				return res, errors.Errorf("unexpected key '%s' in '%s'", key, field)
+			}
+		}
+	}
+	if res.Format == "" {
+		res.Format = "table"
+	}
+
+	switch res.Type {
+	case "targets", "variables":
+	default:
+		return res, errors.Errorf("invalid list type %q", res.Type)
+	}
+
+	switch res.Format {
+	case "table", "json":
+	default:
+		return res, errors.Errorf("invalid list format %q", res.Format)
+	}
+
+	return res, nil
+}
+
+func printVars(w io.Writer, format string, vars []*hclparser.Variable) error {
 	slices.SortFunc(vars, func(a, b *hclparser.Variable) int {
 		return cmp.Compare(a.Name, b.Name)
 	})
+
+	if format == "json" {
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		return enc.Encode(vars)
+	}
+
 	tw := tabwriter.NewWriter(w, 1, 8, 1, '\t', 0)
 	defer tw.Flush()
 
-	tw.Write([]byte("VARIABLE\tVALUE\tDESCRIPTION\n"))
+	tw.Write([]byte("VARIABLE\tTYPE\tVALUE\tDESCRIPTION\n"))
 
 	for _, v := range vars {
 		var value string
@@ -573,17 +727,12 @@ func printVars(w io.Writer, vars []*hclparser.Variable) error {
 		} else {
 			value = "<null>"
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\n", v.Name, value, v.Description)
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", v.Name, v.Type, value, v.Description)
 	}
 	return nil
 }
 
-func printTargetList(w io.Writer, cfg *bake.Config) error {
-	tw := tabwriter.NewWriter(w, 1, 8, 1, '\t', 0)
-	defer tw.Flush()
-
-	tw.Write([]byte("TARGET\tDESCRIPTION\n"))
-
+func printTargetList(w io.Writer, format string, cfg *bake.Config) error {
 	type targetOrGroup struct {
 		name   string
 		target *bake.Target
@@ -602,6 +751,20 @@ func printTargetList(w io.Writer, cfg *bake.Config) error {
 		return cmp.Compare(a.name, b.name)
 	})
 
+	var tw *tabwriter.Writer
+	if format == "table" {
+		tw = tabwriter.NewWriter(w, 1, 8, 1, '\t', 0)
+		defer tw.Flush()
+		tw.Write([]byte("TARGET\tDESCRIPTION\n"))
+	}
+
+	type targetList struct {
+		Name        string `json:"name"`
+		Description string `json:"description,omitempty"`
+		Group       bool   `json:"group,omitempty"`
+	}
+	var targetsList []targetList
+
 	for _, tgt := range list {
 		if strings.HasPrefix(tgt.name, "_") {
 			// convention for a private target
@@ -610,9 +773,9 @@ func printTargetList(w io.Writer, cfg *bake.Config) error {
 		var descr string
 		if tgt.target != nil {
 			descr = tgt.target.Description
+			targetsList = append(targetsList, targetList{Name: tgt.name, Description: descr})
 		} else if tgt.group != nil {
 			descr = tgt.group.Description
-
 			if len(tgt.group.Targets) > 0 {
 				slices.Sort(tgt.group.Targets)
 				names := strings.Join(tgt.group.Targets, ", ")
@@ -622,8 +785,17 @@ func printTargetList(w io.Writer, cfg *bake.Config) error {
 					descr = names
 				}
 			}
+			targetsList = append(targetsList, targetList{Name: tgt.name, Description: descr, Group: true})
 		}
-		fmt.Fprintf(tw, "%s\t%s\n", tgt.name, descr)
+		if format == "table" {
+			fmt.Fprintf(tw, "%s\t%s\n", tgt.name, descr)
+		}
+	}
+
+	if format == "json" {
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		return enc.Encode(targetsList)
 	}
 
 	return nil

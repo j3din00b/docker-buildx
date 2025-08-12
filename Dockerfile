@@ -1,23 +1,27 @@
 # syntax=docker/dockerfile:1
 
-ARG GO_VERSION=1.23
+ARG GO_VERSION=1.24
+ARG ALPINE_VERSION=3.22
 ARG XX_VERSION=1.6.1
 
 # for testing
-ARG DOCKER_VERSION=27.4.0-rc.2
+ARG DOCKER_VERSION=28.3.0
+ARG DOCKER_VERSION_ALT_27=27.5.1
 ARG DOCKER_VERSION_ALT_26=26.1.3
 ARG DOCKER_CLI_VERSION=${DOCKER_VERSION}
 ARG GOTESTSUM_VERSION=v1.12.0
-ARG REGISTRY_VERSION=2.8.3
-ARG BUILDKIT_VERSION=v0.17.2
-ARG UNDOCK_VERSION=0.8.0
+ARG REGISTRY_VERSION=3.0.0
+ARG BUILDKIT_VERSION=v0.23.2
+ARG UNDOCK_VERSION=0.9.0
 
 FROM --platform=$BUILDPLATFORM tonistiigi/xx:${XX_VERSION} AS xx
-FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-alpine AS golatest
+FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-alpine${ALPINE_VERSION} AS golatest
 FROM moby/moby-bin:$DOCKER_VERSION AS docker-engine
 FROM dockereng/cli-bin:$DOCKER_CLI_VERSION AS docker-cli
-FROM moby/moby-bin:$DOCKER_VERSION_ALT_26 AS docker-engine-alt
-FROM dockereng/cli-bin:$DOCKER_VERSION_ALT_26 AS docker-cli-alt
+FROM moby/moby-bin:$DOCKER_VERSION_ALT_27 AS docker-engine-alt27
+FROM moby/moby-bin:$DOCKER_VERSION_ALT_26 AS docker-engine-alt26
+FROM dockereng/cli-bin:$DOCKER_VERSION_ALT_27 AS docker-cli-alt27
+FROM dockereng/cli-bin:$DOCKER_VERSION_ALT_26 AS docker-cli-alt26
 FROM registry:$REGISTRY_VERSION AS registry
 FROM moby/buildkit:$BUILDKIT_VERSION AS buildkit
 FROM crazymax/undock:$UNDOCK_VERSION AS undock
@@ -101,6 +105,7 @@ COPY --link --from=buildx-build /usr/bin/docker-buildx /buildx
 FROM binaries-unix AS binaries-darwin
 FROM binaries-unix AS binaries-freebsd
 FROM binaries-unix AS binaries-linux
+FROM binaries-unix AS binaries-netbsd
 FROM binaries-unix AS binaries-openbsd
 
 FROM scratch AS binaries-windows
@@ -126,19 +131,21 @@ COPY --link --from=gotestsum /out /usr/bin/
 COPY --link --from=registry /bin/registry /usr/bin/
 COPY --link --from=docker-engine / /usr/bin/
 COPY --link --from=docker-cli / /usr/bin/
-COPY --link --from=docker-engine-alt / /opt/docker-alt-26/
-COPY --link --from=docker-cli-alt / /opt/docker-alt-26/
+COPY --link --from=docker-engine-alt27 / /opt/docker-alt-27/
+COPY --link --from=docker-engine-alt26 / /opt/docker-alt-26/
+COPY --link --from=docker-cli-alt27 / /opt/docker-alt-27/
+COPY --link --from=docker-cli-alt26 / /opt/docker-alt-26/
 COPY --link --from=buildkit /usr/bin/buildkitd /usr/bin/
 COPY --link --from=buildkit /usr/bin/buildctl /usr/bin/
 COPY --link --from=undock /usr/local/bin/undock /usr/bin/
 COPY --link --from=binaries /buildx /usr/bin/
-ENV TEST_DOCKER_EXTRA="docker@26.1=/opt/docker-alt-26"
+ENV TEST_DOCKER_EXTRA="docker@27.5=/opt/docker-alt-27,docker@26.1=/opt/docker-alt-26"
 
 FROM integration-test-base AS integration-test
 COPY . .
 
 # Release
-FROM --platform=$BUILDPLATFORM alpine AS releaser
+FROM --platform=$BUILDPLATFORM alpine:${ALPINE_VERSION} AS releaser
 WORKDIR /work
 ARG TARGETPLATFORM
 RUN --mount=from=binaries \
@@ -153,7 +160,7 @@ COPY --from=releaser /out/ /
 
 # Shell
 FROM docker:$DOCKER_VERSION AS dockerd-release
-FROM alpine AS shell
+FROM alpine:${ALPINE_VERSION} AS shell
 RUN apk add --no-cache iptables tmux git vim less openssh
 RUN mkdir -p /usr/local/lib/docker/cli-plugins && ln -s /usr/local/bin/buildx /usr/local/lib/docker/cli-plugins/docker-buildx
 COPY ./hack/demo-env/entrypoint.sh /usr/local/bin

@@ -20,7 +20,7 @@ import (
 )
 
 type SourceOp struct {
-	MarshalCache
+	cache       MarshalCache
 	id          string
 	attrs       map[string]string
 	output      Output
@@ -49,7 +49,10 @@ func (s *SourceOp) Validate(ctx context.Context, c *Constraints) error {
 }
 
 func (s *SourceOp) Marshal(ctx context.Context, constraints *Constraints) (digest.Digest, []byte, *pb.OpMetadata, []*SourceLocation, error) {
-	if dgst, dt, md, srcs, err := s.Load(constraints); err == nil {
+	cache := s.cache.Acquire()
+	defer cache.Release()
+
+	if dgst, dt, md, srcs, err := cache.Load(constraints); err == nil {
 		return dgst, dt, md, srcs, nil
 	}
 
@@ -82,7 +85,7 @@ func (s *SourceOp) Marshal(ctx context.Context, constraints *Constraints) (diges
 		return "", nil, nil, nil, err
 	}
 
-	return s.Store(dt, md, s.constraints.SourceLocations, constraints)
+	return cache.Store(dt, md, s.constraints.SourceLocations, constraints)
 }
 
 func (s *SourceOp) Output() Output {
@@ -133,7 +136,7 @@ func Image(ref string, opts ...ImageOption) State {
 	} else if info.metaResolver != nil {
 		if _, ok := r.(reference.Digested); ok || !info.resolveDigest {
 			return NewState(src.Output()).Async(func(ctx context.Context, st State, c *Constraints) (State, error) {
-				p := info.Constraints.Platform
+				p := info.Platform
 				if p == nil {
 					p = c.Platform
 				}
@@ -150,7 +153,7 @@ func Image(ref string, opts ...ImageOption) State {
 			})
 		}
 		return Scratch().Async(func(ctx context.Context, _ State, c *Constraints) (State, error) {
-			p := info.Constraints.Platform
+			p := info.Platform
 			if p == nil {
 				p = c.Platform
 			}
@@ -319,6 +322,12 @@ func Git(url, ref string, opts ...GitOption) State {
 		addCap(&gi.Constraints, pb.CapSourceGitMountSSHSock)
 	}
 
+	checksum := gi.Checksum
+	if checksum != "" {
+		attrs[pb.AttrGitChecksum] = checksum
+		addCap(&gi.Constraints, pb.CapSourceGitChecksum)
+	}
+
 	addCap(&gi.Constraints, pb.CapSourceGit)
 
 	source := NewSource("git://"+id, attrs, gi.Constraints)
@@ -342,6 +351,7 @@ type GitInfo struct {
 	addAuthCap       bool
 	KnownSSHHosts    string
 	MountSSHSock     string
+	Checksum         string
 }
 
 func KeepGitDir() GitOption {
@@ -357,13 +367,6 @@ func AuthTokenSecret(v string) GitOption {
 	})
 }
 
-func AuthHeaderSecret(v string) GitOption {
-	return gitOptionFunc(func(gi *GitInfo) {
-		gi.AuthHeaderSecret = v
-		gi.addAuthCap = true
-	})
-}
-
 func KnownSSHHosts(key string) GitOption {
 	key = strings.TrimSuffix(key, "\n")
 	return gitOptionFunc(func(gi *GitInfo) {
@@ -375,6 +378,35 @@ func MountSSHSock(sshID string) GitOption {
 	return gitOptionFunc(func(gi *GitInfo) {
 		gi.MountSSHSock = sshID
 	})
+}
+
+func GitChecksum(v string) GitOption {
+	return gitOptionFunc(func(gi *GitInfo) {
+		gi.Checksum = v
+	})
+}
+
+// AuthOption can be used with either HTTP or Git sources.
+type AuthOption interface {
+	GitOption
+	HTTPOption
+}
+
+// AuthHeaderSecret returns an AuthOption that defines the name of a
+// secret to use for HTTP based authentication.
+func AuthHeaderSecret(secretName string) AuthOption {
+	return struct {
+		GitOption
+		HTTPOption
+	}{
+		GitOption: gitOptionFunc(func(gi *GitInfo) {
+			gi.AuthHeaderSecret = secretName
+			gi.addAuthCap = true
+		}),
+		HTTPOption: httpOptionFunc(func(hi *HTTPInfo) {
+			hi.AuthHeaderSecret = secretName
+		}),
+	}
 }
 
 // Scratch returns a state that represents an empty filesystem.
@@ -415,6 +447,13 @@ func Local(name string, opts ...LocalOption) State {
 		if gi.Differ.Required {
 			addCap(&gi.Constraints, pb.CapSourceLocalDiffer)
 		}
+	}
+	if gi.MetadataOnlyCollector {
+		attrs[pb.AttrMetadataTransfer] = "true"
+		if gi.MetadataOnlyExceptions != "" {
+			attrs[pb.AttrMetadataTransferExclude] = gi.MetadataOnlyExceptions
+		}
+		addCap(&gi.Constraints, pb.CapSourceMetadataTransfer)
 	}
 
 	addCap(&gi.Constraints, pb.CapSourceLocal)
@@ -483,6 +522,18 @@ func Differ(t DiffType, required bool) LocalOption {
 		li.Differ = DifferInfo{
 			Type:     t,
 			Required: required,
+		}
+	})
+}
+
+func MetadataOnlyTransfer(exceptions []string) LocalOption {
+	return localOptionFunc(func(li *LocalInfo) {
+		li.MetadataOnlyCollector = true
+		if len(exceptions) == 0 {
+			li.MetadataOnlyExceptions = ""
+		} else {
+			dt, _ := json.Marshal(exceptions) // empty on error
+			li.MetadataOnlyExceptions = string(dt)
 		}
 	})
 }
@@ -559,12 +610,14 @@ type DifferInfo struct {
 
 type LocalInfo struct {
 	constraintsWrapper
-	SessionID       string
-	IncludePatterns string
-	ExcludePatterns string
-	FollowPaths     string
-	SharedKeyHint   string
-	Differ          DifferInfo
+	SessionID              string
+	IncludePatterns        string
+	ExcludePatterns        string
+	FollowPaths            string
+	SharedKeyHint          string
+	Differ                 DifferInfo
+	MetadataOnlyCollector  bool
+	MetadataOnlyExceptions string
 }
 
 func HTTP(url string, opts ...HTTPOption) State {
@@ -592,6 +645,14 @@ func HTTP(url string, opts ...HTTPOption) State {
 		attrs[pb.AttrHTTPGID] = strconv.Itoa(hi.GID)
 		addCap(&hi.Constraints, pb.CapSourceHTTPUIDGID)
 	}
+	if hi.AuthHeaderSecret != "" {
+		attrs[pb.AttrHTTPAuthHeaderSecret] = hi.AuthHeaderSecret
+		addCap(&hi.Constraints, pb.CapSourceHTTPAuth)
+	}
+	if hi.Header != nil {
+		hi.Header.setAttrs(attrs)
+		addCap(&hi.Constraints, pb.CapSourceHTTPHeader)
+	}
 
 	addCap(&hi.Constraints, pb.CapSourceHTTP)
 	source := NewSource(url, attrs, hi.Constraints)
@@ -600,11 +661,13 @@ func HTTP(url string, opts ...HTTPOption) State {
 
 type HTTPInfo struct {
 	constraintsWrapper
-	Checksum digest.Digest
-	Filename string
-	Perm     int
-	UID      int
-	GID      int
+	Checksum         digest.Digest
+	Filename         string
+	Perm             int
+	UID              int
+	GID              int
+	AuthHeaderSecret string
+	Header           *HTTPHeader
 }
 
 type HTTPOption interface {
@@ -640,6 +703,33 @@ func Chown(uid, gid int) HTTPOption {
 		hi.UID = uid
 		hi.GID = gid
 	})
+}
+
+// Header returns an [HTTPOption] that ensures additional request headers will
+// be sent when retrieving the HTTP source.
+func Header(header HTTPHeader) HTTPOption {
+	return httpOptionFunc(func(hi *HTTPInfo) {
+		hi.Header = &header
+	})
+}
+
+type HTTPHeader struct {
+	Accept    string
+	UserAgent string
+}
+
+func (hh *HTTPHeader) setAttrs(attrs map[string]string) {
+	if hh.Accept != "" {
+		attrs[hh.attr("accept")] = hh.Accept
+	}
+
+	if hh.UserAgent != "" {
+		attrs[hh.attr("user-agent")] = hh.UserAgent
+	}
+}
+
+func (hh *HTTPHeader) attr(name string) string {
+	return pb.AttrHTTPHeaderPrefix + name
 }
 
 func platformSpecificSource(id string) bool {

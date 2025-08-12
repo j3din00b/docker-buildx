@@ -7,6 +7,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/containerd/platforms"
@@ -18,7 +19,6 @@ import (
 	"github.com/moby/buildkit/frontend/gateway/client"
 	"github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/util/flightcontrol"
-	dockerspec "github.com/moby/docker-image-spec/specs-go/v1"
 	"github.com/moby/patternmatcher/ignorefile"
 	digest "github.com/opencontainers/go-digest"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
@@ -67,6 +67,7 @@ type Config struct {
 	ShmSize          int64
 	Target           string
 	Ulimits          []*pb.Ulimit
+	Devices          []*pb.CDIDevice
 	LinterConfig     *linter.Config
 
 	CacheImports           []client.CacheOptionsEntry
@@ -85,6 +86,7 @@ type Client struct {
 	localsSessionIDs map[string]string
 
 	dockerignore     []byte
+	dockerignoreMu   sync.Mutex
 	dockerignoreName string
 }
 
@@ -148,9 +150,11 @@ func (bc *Client) BuildOpts() client.BuildOpts {
 func (bc *Client) init() error {
 	opts := bc.bopts.Opts
 
-	defaultBuildPlatform := platforms.Normalize(platforms.DefaultSpec())
+	var defaultBuildPlatform ocispecs.Platform
 	if workers := bc.bopts.Workers; len(workers) > 0 && len(workers[0].Platforms) > 0 {
 		defaultBuildPlatform = workers[0].Platforms[0]
+	} else {
+		defaultBuildPlatform = platforms.Normalize(platforms.DefaultSpec())
 	}
 	buildPlatforms := []ocispecs.Platform{defaultBuildPlatform}
 	targetPlatforms := []ocispecs.Platform{}
@@ -452,23 +456,25 @@ func (bc *Client) MainContext(ctx context.Context, opts ...llb.LocalOption) (*ll
 	return &st, nil
 }
 
-func (bc *Client) NamedContext(ctx context.Context, name string, opt ContextOpt) (*llb.State, *dockerspec.DockerOCIImage, error) {
+func (bc *Client) NamedContext(name string, opt ContextOpt) (*NamedContext, error) {
 	named, err := reference.ParseNormalizedNamed(name)
 	if err != nil {
-		return nil, nil, errors.Wrapf(err, "invalid context name %s", name)
+		return nil, errors.Wrapf(err, "invalid context name %s", name)
 	}
 	name = strings.TrimSuffix(reference.FamiliarString(named), ":latest")
 
-	pp := platforms.DefaultSpec()
+	var pp ocispecs.Platform
 	if opt.Platform != nil {
 		pp = *opt.Platform
+	} else {
+		pp = platforms.DefaultSpec()
 	}
-	pname := name + "::" + platforms.Format(platforms.Normalize(pp))
-	st, img, err := bc.namedContext(ctx, name, pname, opt)
-	if err != nil || st != nil {
-		return st, img, err
+	pname := name + "::" + platforms.FormatAll(platforms.Normalize(pp))
+	nc, err := bc.namedContext(name, pname, opt)
+	if err != nil || nc != nil {
+		return nc, err
 	}
-	return bc.namedContext(ctx, name, name, opt)
+	return bc.namedContext(name, name, opt)
 }
 
 func (bc *Client) IsNoCache(name string) bool {
@@ -512,6 +518,8 @@ func WithInternalName(name string) llb.ConstraintsOpt {
 }
 
 func (bc *Client) dockerIgnorePatterns(ctx context.Context, bctx *buildContext) ([]string, error) {
+	bc.dockerignoreMu.Lock()
+	defer bc.dockerignoreMu.Unlock()
 	if bc.dockerignore == nil {
 		sessionID := bc.bopts.SessionID
 		if v, ok := bc.localsSessionIDs[bctx.contextLocalName]; ok {

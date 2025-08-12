@@ -6,7 +6,7 @@ import (
 	"strings"
 
 	"github.com/docker/buildx/util/platformutil"
-	v1 "github.com/opencontainers/image-spec/specs-go/v1"
+	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -32,6 +32,7 @@ type DeploymentOpt struct {
 	// files mounted at /etc/buildkitd
 	ConfigFiles map[string][]byte
 
+	BuildKitRootVolumeMemory string
 	Rootless                 bool
 	NodeSelector             map[string]string
 	CustomAnnotations        map[string]string
@@ -43,13 +44,15 @@ type DeploymentOpt struct {
 	LimitsCPU                string
 	LimitsMemory             string
 	LimitsEphemeralStorage   string
-	Platforms                []v1.Platform
+	Platforms                []ocispecs.Platform
 }
 
 const (
 	containerName      = "buildkitd"
 	AnnotationPlatform = "buildx.docker.com/platform"
 	LabelApp           = "app"
+	rootVolumeName     = "buildkit-memory"
+	rootVolumePath     = "/var/lib/buildkit"
 )
 
 type ErrReservedAnnotationPlatform struct{}
@@ -247,6 +250,26 @@ func NewDeployment(opt *DeploymentOpt) (d *appsv1.Deployment, c []*corev1.Config
 		d.Spec.Template.Spec.Containers[0].Resources.Limits[corev1.ResourceEphemeralStorage] = limEphemeralStorage
 	}
 
+	if opt.BuildKitRootVolumeMemory != "" {
+		buildKitRootVolumeMemory, err := resource.ParseQuantity(opt.BuildKitRootVolumeMemory)
+		if err != nil {
+			return nil, nil, err
+		}
+		d.Spec.Template.Spec.Volumes = append(d.Spec.Template.Spec.Volumes, corev1.Volume{
+			Name: rootVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{
+					Medium:    "Memory",
+					SizeLimit: &buildKitRootVolumeMemory,
+				},
+			},
+		})
+		d.Spec.Template.Spec.Containers[0].VolumeMounts = append(d.Spec.Template.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{
+			Name:      rootVolumeName,
+			MountPath: rootVolumePath,
+		})
+	}
+
 	return
 }
 
@@ -260,10 +283,10 @@ func toRootless(d *appsv1.Deployment) error {
 			Type: corev1.SeccompProfileTypeUnconfined,
 		},
 	}
-	if d.Spec.Template.ObjectMeta.Annotations == nil {
-		d.Spec.Template.ObjectMeta.Annotations = make(map[string]string, 1)
+	if d.Spec.Template.Annotations == nil {
+		d.Spec.Template.Annotations = make(map[string]string, 1)
 	}
-	d.Spec.Template.ObjectMeta.Annotations["container.apparmor.security.beta.kubernetes.io/"+containerName] = "unconfined"
+	d.Spec.Template.Annotations["container.apparmor.security.beta.kubernetes.io/"+containerName] = "unconfined"
 
 	// Dockerfile has `VOLUME /home/user/.local/share/buildkit` by default too,
 	// but the default VOLUME does not work with rootless on Google's Container-Optimized OS

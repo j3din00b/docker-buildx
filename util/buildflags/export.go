@@ -1,11 +1,14 @@
 package buildflags
 
 import (
+	"encoding/csv"
+	"encoding/json"
+	"maps"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/containerd/platforms"
-	controllerapi "github.com/docker/buildx/controller/pb"
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/exporter/containerimage/exptypes"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
@@ -13,72 +16,151 @@ import (
 	"github.com/tonistiigi/go-csvvalue"
 )
 
-func ParseExports(inp []string) ([]*controllerapi.ExportEntry, error) {
-	var outs []*controllerapi.ExportEntry
+type Exports []*ExportEntry
+
+func (e Exports) Merge(other Exports) Exports {
+	if other == nil {
+		e.Normalize()
+		return e
+	} else if e == nil {
+		other.Normalize()
+		return other
+	}
+
+	return append(e, other...).Normalize()
+}
+
+func (e Exports) Normalize() Exports {
+	if len(e) == 0 {
+		return nil
+	}
+	return removeDupes(e)
+}
+
+type ExportEntry struct {
+	Type        string            `json:"type"`
+	Attrs       map[string]string `json:"attrs,omitempty"`
+	Destination string            `json:"dest,omitempty"`
+}
+
+func (e *ExportEntry) Equal(other *ExportEntry) bool {
+	if e.Type != other.Type || e.Destination != other.Destination {
+		return false
+	}
+	return maps.Equal(e.Attrs, other.Attrs)
+}
+
+func (e *ExportEntry) String() string {
+	var b csvBuilder
+	if e.Type != "" {
+		b.Write("type", e.Type)
+	}
+	if e.Destination != "" {
+		b.Write("dest", e.Destination)
+	}
+	if len(e.Attrs) > 0 {
+		b.WriteAttributes(e.Attrs)
+	}
+	return b.String()
+}
+
+func (e *ExportEntry) MarshalJSON() ([]byte, error) {
+	m := maps.Clone(e.Attrs)
+	if m == nil {
+		m = map[string]string{}
+	}
+	m["type"] = e.Type
+	if e.Destination != "" {
+		m["dest"] = e.Destination
+	}
+	return json.Marshal(m)
+}
+
+func (e *ExportEntry) UnmarshalJSON(data []byte) error {
+	var m map[string]string
+	if err := json.Unmarshal(data, &m); err != nil {
+		return err
+	}
+
+	e.Type = m["type"]
+	delete(m, "type")
+
+	e.Destination = m["dest"]
+	delete(m, "dest")
+
+	e.Attrs = m
+	return e.validate()
+}
+
+func (e *ExportEntry) UnmarshalText(text []byte) error {
+	s := string(text)
+	fields, err := csvvalue.Fields(s, nil)
+	if err != nil {
+		return err
+	}
+
+	// Clear the target entry.
+	e.Type = ""
+	e.Attrs = map[string]string{}
+	e.Destination = ""
+
+	if len(fields) == 1 && fields[0] == s && !strings.HasPrefix(s, "type=") {
+		if s != "-" {
+			e.Type = client.ExporterLocal
+			e.Destination = s
+			return nil
+		}
+
+		e.Type = client.ExporterTar
+		e.Destination = s
+	}
+
+	if e.Type == "" {
+		for _, field := range fields {
+			parts := strings.SplitN(field, "=", 2)
+			if len(parts) != 2 {
+				return errors.Errorf("invalid value %s", field)
+			}
+			key := strings.TrimSpace(strings.ToLower(parts[0]))
+			value := parts[1]
+			switch key {
+			case "type":
+				e.Type = value
+			case "dest":
+				e.Destination = value
+			default:
+				e.Attrs[key] = value
+			}
+		}
+	}
+	return e.validate()
+}
+
+func (e *ExportEntry) validate() error {
+	if e.Type == "" {
+		return errors.Errorf("type is required for output")
+	}
+	return nil
+}
+
+func ParseExports(inp []string) ([]*ExportEntry, error) {
 	if len(inp) == 0 {
 		return nil, nil
 	}
+
+	exports := make(Exports, 0, len(inp))
 	for _, s := range inp {
 		if s == "" {
 			continue
 		}
-		fields, err := csvvalue.Fields(s, nil)
-		if err != nil {
+
+		var out ExportEntry
+		if err := out.UnmarshalText([]byte(s)); err != nil {
 			return nil, err
 		}
-
-		out := controllerapi.ExportEntry{
-			Attrs: map[string]string{},
-		}
-		if len(fields) == 1 && fields[0] == s && !strings.HasPrefix(s, "type=") {
-			if s != "-" {
-				outs = append(outs, &controllerapi.ExportEntry{
-					Type:        client.ExporterLocal,
-					Destination: s,
-				})
-				continue
-			}
-			out = controllerapi.ExportEntry{
-				Type:        client.ExporterTar,
-				Destination: s,
-			}
-		}
-
-		if out.Type == "" {
-			for _, field := range fields {
-				parts := strings.SplitN(field, "=", 2)
-				if len(parts) != 2 {
-					return nil, errors.Errorf("invalid value %s", field)
-				}
-				key := strings.TrimSpace(strings.ToLower(parts[0]))
-				value := parts[1]
-				switch key {
-				case "type":
-					out.Type = value
-				default:
-					out.Attrs[key] = value
-				}
-			}
-		}
-		if out.Type == "" {
-			return nil, errors.Errorf("type is required for output")
-		}
-
-		if out.Type == "registry" {
-			out.Type = client.ExporterImage
-			if _, ok := out.Attrs["push"]; !ok {
-				out.Attrs["push"] = "true"
-			}
-		}
-
-		if dest, ok := out.Attrs["dest"]; ok {
-			out.Destination = dest
-			delete(out.Attrs, "dest")
-		}
-
-		outs = append(outs, &out)
+		exports = append(exports, &out)
 	}
-	return outs, nil
+	return exports, nil
 }
 
 func ParseAnnotations(inp []string) (map[exptypes.AnnotationKey]string, error) {
@@ -89,6 +171,10 @@ func ParseAnnotations(inp []string) (map[exptypes.AnnotationKey]string, error) {
 
 	annotations := make(map[exptypes.AnnotationKey]string)
 	for _, inp := range inp {
+		if inp == "" {
+			continue
+		}
+
 		k, v, ok := strings.Cut(inp, "=")
 		if !ok {
 			return nil, errors.Errorf("invalid annotation %q, expected key=value", inp)
@@ -143,4 +229,42 @@ func ParseAnnotations(inp []string) (map[exptypes.AnnotationKey]string, error) {
 		}
 	}
 	return annotations, nil
+}
+
+type csvBuilder struct {
+	sb strings.Builder
+}
+
+func (w *csvBuilder) Write(key, value string) {
+	if w.sb.Len() > 0 {
+		w.sb.WriteByte(',')
+	}
+
+	pair := key + "=" + value
+	if strings.ContainsRune(pair, ',') || strings.ContainsRune(pair, '"') {
+		var attr strings.Builder
+		writer := csv.NewWriter(&attr)
+		writer.Write([]string{pair})
+		writer.Flush()
+		// Strips the extra newline added by the csv writer
+		pair = strings.TrimSpace(attr.String())
+	}
+
+	w.sb.WriteString(pair)
+}
+
+func (w *csvBuilder) WriteAttributes(attrs map[string]string) {
+	keys := make([]string, 0, len(attrs))
+	for key := range attrs {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	for _, key := range keys {
+		w.Write(key, attrs[key])
+	}
+}
+
+func (w *csvBuilder) String() string {
+	return w.sb.String()
 }
